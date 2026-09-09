@@ -6,13 +6,21 @@ on:
         description: JSON array of query strings
         required: true
         type: string
+      engine:
+        description: browser engine (webkit | camoufox)
+        required: false
+        default: webkit
+        type: string
 permissions:
   contents: read
 concurrency:
   group: batch-${{ github.run_id }}
 jobs:
   run:
-    runs-on: ubuntu-latest
+    # Camoufox's Firefox build segfaults on ubuntu-latest (24.04/noble, glibc
+    # 2.39); it launches cleanly on the older 22.04 image. WebKit stays on
+    # latest where the pump already runs it.
+    runs-on: ${{ inputs.engine == 'camoufox' && 'ubuntu-22.04' || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -20,16 +28,53 @@ jobs:
         with:
           node-version: 20
       - name: Cache playwright browsers
+        if: inputs.engine != 'camoufox'
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: pw-webkit-${{ runner.os }}-1
+      - name: Cache camoufox browser
+        if: inputs.engine == 'camoufox'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/camoufox
+          key: camoufox-${{ runner.os }}-1
       - run: npm install --no-audit --no-fund
-      - run: npx playwright install --with-deps webkit
-      - run: node runner.js
+      - name: Install WebKit
+        if: inputs.engine != 'camoufox'
+        # dl.google.com's chrome apt repo periodically serves mismatched
+        # metadata (Hash Sum mismatch); playwright's apt-get update then exits
+        # 100 and kills the run (fleet-wide 2026-09-09). We install nothing
+        # from the third-party sources — drop the known-flaky ones first.
+        # (Targeted rm only: ubuntu.sources in the same dir IS the main repo.)
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod*
+          npx playwright install --with-deps webkit
+      - name: Install Camoufox
+        if: inputs.engine == 'camoufox'
+        # Camoufox is a Firefox fork; it needs Firefox's system libraries (via
+        # Playwright's deps) AND runs headful under Xvfb — true-headless
+        # segfaults on the Ubuntu runners (exit 139 on launch).
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod*
+          npx playwright install-deps firefox
+          sudo apt-get install -y xvfb
+          npx camoufox-js fetch
+      - name: Run (webkit)
+        if: inputs.engine != 'camoufox'
+        run: node runner.js
         env:
           QUERIES_JSON: ${{ inputs.queries }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
+          BROWSER: ${{ inputs.engine }}
+      - name: Run (camoufox)
+        if: inputs.engine == 'camoufox'
+        # headless:'virtual' in the runner starts its own Xvfb, so no wrapper.
+        run: node runner.js
+        env:
+          QUERIES_JSON: ${{ inputs.queries }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          BROWSER: ${{ inputs.engine }}
       - uses: actions/upload-artifact@v4
         with:
           name: results
