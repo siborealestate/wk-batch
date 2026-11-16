@@ -11,6 +11,34 @@ const pw = require('playwright');
 const queries = JSON.parse(process.env.QUERIES_JSON || '[]');
 const GAP_MS = 3000;
 
+// ENGINE SWITCH (2026-08-02): BROWSER=camoufox runs the batch on Camoufox (a
+// Firefox stealth fork with C++-level fingerprint spoofing) instead of WebKit.
+// The bet, proven on the RackNerd relay box the same day: Camoufox clears
+// Startpage on a raw datacenter IP that WebKit gets walled on. GitHub's Azure
+// runner IPs are exactly that kind of IP — WebKit walls them, so proxy-less
+// accounts (reefhaus) fall all the way back to DDG. If Camoufox clears the
+// Azure IP directly, those runs return real Google (Startpage) for $0 proxy
+// cost. Falls back to WebKit if camoufox-js isn't installed.
+const USE_CAMOUFOX = process.env.BROWSER === 'camoufox';
+let Camoufox = null;
+if (USE_CAMOUFOX) {
+  try { Camoufox = require('camoufox-js').Camoufox; }
+  catch { console.error('BROWSER=camoufox set but camoufox-js not installed — using WebKit'); }
+}
+// Returns a Playwright Browser. For Camoufox we use the high-level Camoufox()
+// wrapper with headless:'virtual' — it manages the Xvfb virtual display and the
+// env Camoufox needs itself (the low-level launchOptions+firefox.launch path
+// segfaulted on the GH runners; the wrapper is camoufox-js's primary API).
+async function launchBrowser(proxyOptions) {
+  if (USE_CAMOUFOX && Camoufox) {
+    // headless:true matches the proven RackNerd config (Debian 12, broad
+    // playwright deps). CAMOUFOX_HEADLESS=virtual switches to the Xvfb path.
+    const headless = process.env.CAMOUFOX_HEADLESS === 'virtual' ? 'virtual' : true;
+    return Camoufox({ headless, geoip: !!proxyOptions.proxy, ...(proxyOptions.proxy ? { proxy: proxyOptions.proxy } : {}) });
+  }
+  return pw.webkit.launch({ headless: true, ...proxyOptions });
+}
+
 // Sticky exit per run (2026-08-02): the runner used a bare rotating proxy, so
 // every query got a fresh exit IP against one cold context — clearance never
 // held, the challenge re-walled, and this account's runs fell back to DDG far
@@ -40,8 +68,12 @@ function proxyOpt() {
 let browser = null, ctx = null;
 async function getCtx() {
   if (ctx) return ctx;
-  browser = await pw.webkit.launch({ headless: true, ...proxyOpt() });
-  ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const b = await launchBrowser(proxyOpt());
+  // WebKit returns a Browser (→ newContext); the Camoufox() wrapper may return
+  // a Browser or an already-open persistent context. Use newContext if present,
+  // otherwise treat the returned object as the context.
+  if (typeof b.newContext === 'function') { browser = b; ctx = await b.newContext({ viewport: { width: 1280, height: 900 } }); }
+  else { browser = b.browser ? b.browser() : b; ctx = b; }
   // Lean mode (2026-07-31): runner traffic transits the residential proxy and
   // bills real GB. Abort heavy subresources AND every third-party host —
   // startpage.com's own document/scripts/xhr must pass (blocking its scripts
@@ -49,6 +81,10 @@ async function getCtx() {
   await ctx.route('**/*', (route) => {
     const t = route.request().resourceType();
     if (['image', 'media', 'font', 'stylesheet'].includes(t)) return route.abort();
+    // Anubis PoW wall (Startpage 2026-09-18): its solver worker fetches via
+    // blob: URLs (empty hostname → aborted by the allowlist below, challenge
+    // never solves). blob: is same-origin by construction; let it through.
+    if (route.request().url().startsWith('blob:')) return route.continue();
     let host = '';
     try { host = new URL(route.request().url()).hostname; } catch {}
     if (t === 'document' || /(^|\.)startpage\.com$/.test(host) || /(^|\.)duckduckgo\.com$/.test(host)) return route.continue();
@@ -65,6 +101,14 @@ async function fetchStartpage(query) {
     await page.goto(`https://www.startpage.com/sp/search?query=${encodeURIComponent(query)}`, { waitUntil: 'domcontentloaded', timeout: 35000 });
     let title = await page.title();
     for (let w = 0; w < 6 && /just a moment|verification/i.test(title); w++) { await page.waitForTimeout(3000); title = await page.title(); }
+    // Anubis interstitial (2026-09-18): empty-title challenge page; solves in
+    // ~1-2s once its blob: worker passes the route diet, then navigates to the
+    // real SERP. Wait it out before the parse.
+    for (let w = 0; w < 8; w++) {
+      const anubis = await page.evaluate(() => !!document.getElementById('anubis-main')).catch(() => false);
+      if (!anubis) break;
+      await page.waitForTimeout(1500);
+    }
     await page.waitForTimeout(1500);
     const results = await page.evaluate(() => {
       const blocks = document.querySelectorAll('.result, .w-gl__result, [class*="result"][class*="card"]');
@@ -72,7 +116,7 @@ async function fetchStartpage(query) {
       for (const b of blocks) {
         const a = b.querySelector('a.result-link, a.w-gl__result-title, a[href^="http"]');
         if (!a) continue;
-        let t = (b.querySelector('h2, h3') || b.querySelector('[class*="title"]') || a).textContent.trim();
+        let t = (b.querySelector('h2, h3') || b.querySelector('a.result-link, a.w-gl__result-title') || a).textContent.trim(); // 2026-09-18: [class*="title"] now hits wgl-site-title junk; real title = result-link anchor text
         t = t.replace(/^\.css-\S+\{[^}]*\}/g, '').trim().slice(0, 90);
         const snippet = (b.querySelector('p, [class*="description"], [class*="snippet"]') || {}).textContent || '';
         o.push({ title: t, url: a.href, snippet: snippet.trim().slice(0, 160) });
@@ -98,14 +142,18 @@ async function fetchDdg(query) {
     if (r.status !== 200) return { error: `ddg ${r.status}` };
     const html = await r.text();
     const out = [];
-    const re = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:class="result__snippet"[^>]*>([\s\S]*?)<\/a>)?/g;
+    // Snippet is searched only inside this result's tail (up to the next
+    // result__a): a trailing optional group after a lazy gap always matched
+    // empty, so every DDG snippet came back "" (w433).
+    const re = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>([\s\S]*?)(?=class="result__a"|$)/g;
     let m;
     while ((m = re.exec(html)) && out.length < 12) {
+      const sn = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/.exec(m[3]);
       let url = m[1];
       const uddg = /[?&]uddg=([^&]+)/.exec(url);
       if (uddg) { try { url = decodeURIComponent(uddg[1]); } catch { } }
       const strip = (s) => String(s || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
-      out.push({ title: strip(m[2]).slice(0, 90), url, snippet: strip(m[3]).slice(0, 160) });
+      out.push({ title: strip(m[2]).slice(0, 90), url, snippet: strip(sn && sn[1]).slice(0, 160) });
     }
     if (!out.length) return { error: 'ddg parsed 0 results' };
     return { source: 'ddg', results: out };
